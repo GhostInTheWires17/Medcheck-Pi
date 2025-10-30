@@ -101,3 +101,4 @@ License / Disclaimer
 If you want, I can:
 - Pin specific package versions after you test on your device.
 - Generate a minimal extras/optional requirements file (e.g., requirements-hw.txt) for RPi.
+sudo apt install matchbox-keyboard
