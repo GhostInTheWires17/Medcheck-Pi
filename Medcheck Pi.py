@@ -1073,9 +1073,15 @@ class MainWindow(QMainWindow):
         self.setup_main_screen()
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
         self.showFullScreen()
+        self.setup_settings_screen()
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
+        self.showFullScreen()
         
         # Create results screen
         self.setup_results_screen()
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
+        self.showFullScreen()
+        self.setup_settings_screen()
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
         self.showFullScreen()
         
@@ -1088,9 +1094,15 @@ class MainWindow(QMainWindow):
         self.setup_history_screen()
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
         self.showFullScreen()
+        self.setup_settings_screen()
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
+        self.showFullScreen()
         
         # Create calibration screen
         self.setup_calibration_screen()
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
+        self.showFullScreen()
+        self.setup_settings_screen()
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
         self.showFullScreen()
         
@@ -1098,9 +1110,15 @@ class MainWindow(QMainWindow):
         self.setup_educational_screen()
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
         self.showFullScreen()
+        self.setup_settings_screen()
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
+        self.showFullScreen()
         
         # Show main screen
         self.stacked_widget.setCurrentIndex(0)
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
+        self.showFullScreen()
+        self.setup_settings_screen()
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
         self.showFullScreen()
     
@@ -1983,3 +2001,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
