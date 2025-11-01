@@ -35,6 +35,21 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget,
                             QTextEdit, QCheckBox, QRadioButton, QSpinBox,
                             QFileDialog, QSplashScreen)
 
+# Optional lightweight web dashboard (Flask)
+try:
+    from flask import Flask, request, jsonify
+    FLASK_AVAILABLE = True
+except Exception:
+    FLASK_AVAILABLE = False
+
+import threading
+
+# Shared dashboard state: set 'value' to 'o' or 'c' and .event will be set
+dashboard_state = {
+    'event': threading.Event(),
+    'value': None
+}
+
 # Raspberry Pi specific imports
 try:
     import RPi.GPIO as GPIO
@@ -85,6 +100,13 @@ try:
 except ImportError:
     NETWORK_AVAILABLE = False
     print("Warning: requests not available, network features disabled")
+
+# Roboflow Inference SDK (optional)
+try:
+    from inference_sdk import InferenceHTTPClient
+    INFERENCE_SDK_AVAILABLE = True
+except Exception:
+    INFERENCE_SDK_AVAILABLE = False
 
 # Constants
 DARK_BLUE = "#0A1128"
@@ -310,16 +332,70 @@ class CameraThread(QThread):
         self.running = False
         self.mutex = threading.Lock()
         
-        # Initialize camera if available
+        # Initialize camera: always try USB webcam first via OpenCV, fall back to Pi camera if USB fails
+        self.camera = None
+        self.capture = None
+        self.cv2 = None
+        self.camera_index = 0  # Default to first camera, can be changed
+        
+        # Try OpenCV USB webcam first
+        try:
+            import cv2
+            self.cv2 = cv2
+            # On Windows, CAP_DSHOW often reduces warnings; fallback to default if not available
+            try:
+                self.capture = cv2.VideoCapture(self.camera_index, cv2.CAP_DSHOW)
+            except Exception:
+                self.capture = cv2.VideoCapture(self.camera_index)
+
+            # Try to set a sensible frame size
+            if self.capture and self.capture.isOpened():
+                self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                print("USB webcam initialized successfully")
+                return  # Successfully initialized USB webcam
+            else:
+                self.capture = None
+                print("USB webcam not found or failed to open")
+        except Exception as e:
+            print(f"OpenCV webcam init failed: {e}")
+            self.capture = None
+
+        # Fall back to Pi camera if USB failed and we're on a Pi
         if PI_AVAILABLE:
-            self.camera = Picamera2()
-            config = self.camera.create_preview_configuration(
-                main={"size": (640, 480)},
-                lores={"size": (320, 240), "format": "YUV420"}
-            )
-            self.camera.configure(config)
-        else:
-            self.camera = None
+            try:
+                self.camera = Picamera2()
+                config = self.camera.create_preview_configuration(
+                    main={"size": (640, 480)},
+                    lores={"size": (320, 240), "format": "YUV420"}
+                )
+                self.camera.configure(config)
+                print("Falling back to Pi camera")
+            except Exception as e:
+                print(f"Picamera2 init failed: {e}")
+                self.camera = None
+
+        # If both cameras failed, we'll use dummy images in the run method
+            try:
+                import cv2
+                self.cv2 = cv2
+                # On Windows, CAP_DSHOW often reduces warnings; fallback to default if not available
+                try:
+                    self.capture = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+                except Exception:
+                    self.capture = cv2.VideoCapture(0)
+
+                # Try to set a sensible frame size
+                if self.capture and self.capture.isOpened():
+                    self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                    self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                else:
+                    # No webcam available; fall back to dummy images
+                    self.capture = None
+            except Exception:
+                self.capture = None
+
+        if self.camera is None and self.capture is None:
             # Load dummy images for simulation
             self.dummy_images = [
                 QImage(":/images/sample_medicine1.jpg"),
@@ -350,19 +426,128 @@ class CameraThread(QThread):
                 if not self.running:
                     break
                 
+                img = None
                 # Get frame from camera or simulation
-                if PI_AVAILABLE and self.camera:
-                    buffer = self.camera.capture_array("lores")
-                    img = QImage(buffer, buffer.shape[1], buffer.shape[0], 
-                                QImage.Format.Format_RGB888)
-                else:
-                    # Simulate camera with dummy images
-                    img = self.dummy_images[random.randint(0, len(self.dummy_images)-1)]
-                    img = img.scaled(320, 240)
+                if self.capture is not None:  # Try USB webcam first
+                    # OpenCV USB webcam path
+                    ret, frame = self.capture.read()
+                    if ret and frame is not None:
+                        try:
+                            # Convert BGR (OpenCV) to RGB
+                            frame_rgb = self.cv2.cvtColor(frame, self.cv2.COLOR_BGR2RGB)
+                            h, w, ch = frame_rgb.shape
+                            bytes_per_line = ch * w
+                            img = QImage(frame_rgb.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+                            if img.isNull():
+                                raise ValueError("Created QImage is null")
+                            # Make deep copy to ensure data ownership
+                            img = img.copy()
+                            img = img.scaled(320, 240, Qt.AspectRatioMode.KeepAspectRatio)
+                            print(f"USB Camera: Captured frame {w}x{h} -> {img.width()}x{img.height()}")
+                        except Exception as e:
+                            print(f"USB Camera: Frame conversion failed: {e}")
+                            img = None
+                    else:
+                        print("USB Camera: Failed to read frame")
+                        img = None
+
+                elif self.camera is not None:  # Fall back to Pi camera
+                    try:
+                        # Picamera2 path
+                        buffer = self.camera.capture_array("lores")
+                        # buffer is a numpy array in HxWxC (likely RGB)
+                        h, w = buffer.shape[0], buffer.shape[1]
+                        try:
+                            img = QImage(buffer, w, h, QImage.Format.Format_RGB888)
+                            if img.isNull():
+                                raise ValueError("Created QImage is null")
+                            img = img.copy()  # Deep copy to ensure data ownership
+                        except Exception as e:
+                            print(f"Pi Camera: Direct conversion failed: {e}")
+                            # Fallback: convert to bytes then QImage
+                            try:
+                                rgb = buffer
+                                img = QImage(rgb.data, w, h, rgb.strides[0], QImage.Format.Format_RGB888)
+                                if img.isNull():
+                                    raise ValueError("Created QImage is null")
+                                img = img.copy()
+                                print(f"Pi Camera: Used fallback conversion for {w}x{h} frame")
+                            except Exception as e:
+                                print(f"Pi Camera: Fallback conversion failed: {e}")
+                                img = None
+                    except Exception as e:
+                        print(f"Pi Camera: Capture failed: {e}")
+                        img = None
+
+                if img is None or img.isNull():
+                    # If both cameras failed, use dummy image
+                    try:
+                        img = self.dummy_images[random.randint(0, len(self.dummy_images)-1)]
+                        img = img.scaled(320, 240, Qt.AspectRatioMode.KeepAspectRatio)
+                        print("Using dummy image as fallback")
+                    except Exception as e:
+                        print(f"Failed to load dummy image: {e}")
+                        continue  # Skip this frame entirely
             
             # Emit the frame
             self.frame_ready.emit(img)
             time.sleep(0.03)  # ~30 FPS
+
+
+class DashboardServerThread(threading.Thread):
+        """Simple thread to run a tiny Flask dashboard with two big buttons: O and C."""
+        def __init__(self, host='0.0.0.0', port=5000):
+                super().__init__(daemon=True)
+                self.host = host
+                self.port = port
+
+        def run(self):
+                if not FLASK_AVAILABLE:
+                        print("Flask not available; dashboard disabled. Install Flask to enable web dashboard.")
+                        return
+
+                app = Flask(__name__)
+
+                @app.route('/')
+                def index():
+                        # Minimal page with two big black buttons 'O' and 'C'
+                        return '''
+                        <!doctype html>
+                        <html>
+                        <head>
+                            <meta name="viewport" content="width=device-width, initial-scale=1">
+                            <style>
+                                body { display:flex; height:100vh; margin:0; align-items:center; justify-content:space-around; background:#111; }
+                                button.big { width:40vw; height:60vh; font-size:10vw; background:#000; color:#fff; border-radius:12px; border:2px solid #444; }
+                            </style>
+                        </head>
+                        <body>
+                            <button class="big" onclick="send('o')">O</button>
+                            <button class="big" onclick="send('c')">C</button>
+                            <script>
+                                async function send(v){
+                                    await fetch('/set', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({val: v})});
+                                }
+                            </script>
+                        </body>
+                        </html>
+                        '''
+
+                @app.route('/set', methods=['POST'])
+                def set_val():
+                        try:
+                                data = request.get_json(force=True)
+                                v = data.get('val')
+                                if v in ('o', 'c'):
+                                        dashboard_state['value'] = v
+                                        dashboard_state['event'].set()
+                                        return jsonify({'status':'ok','value':v})
+                        except Exception as e:
+                                print(f"Dashboard set error: {e}")
+                        return jsonify({'status':'error'}), 400
+
+                # Run Flask without reloader in this thread
+                app.run(host=self.host, port=self.port, debug=False, use_reloader=False)
 
 class AIDetectionThread(QThread):
     """Thread for handling AI detection"""
@@ -373,15 +558,8 @@ class AIDetectionThread(QThread):
         self.image_queue = queue.Queue()
         self.running = True
         
-        # Initialize YOLO model if available
-        if YOLO_AVAILABLE:
-            try:
-                self.model = YOLO("yolov8n.pt")  # Use a smaller model for Pi
-            except Exception as e:
-                print(f"Error loading YOLO model: {e}")
-                self.model = None
-        else:
-            self.model = None
+        # No local model needed - using Roboflow inference only
+        pass
     
     def process_image(self, image):
         """Add image to processing queue"""
@@ -399,61 +577,213 @@ class AIDetectionThread(QThread):
                 # Get image from queue with timeout
                 image = self.image_queue.get(timeout=1.0)
                 
-                # Process the image
-                if YOLO_AVAILABLE and self.model:
-                    # Save image to temp file for YOLO processing
-                    temp_path = "temp_scan.jpg"
-                    image.save(temp_path)
-                    
-                    # Run detection
-                    results = self.model(temp_path)
-                    
-                    # Process results
-                    detections = []
-                    for result in results:
-                        for box in result.boxes:
-                            x1, y1, x2, y2 = box.xyxy[0].tolist()
-                            confidence = box.conf[0].item()
-                            class_id = int(box.cls[0].item())
-                            class_name = result.names[class_id]
-                            
-                            detections.append({
-                                "box": (x1, y1, x2, y2),
-                                "confidence": confidence,
-                                "class": class_name
-                            })
-                    
-                    # Determine if medicine is counterfeit based on detections
-                    is_counterfeit = self._analyze_detections(detections)
-                    
-                    # Clean up
-                    os.remove(temp_path)
-                else:
-                    # Simulate AI detection with deterministic alternating cycle
-                    time.sleep(1.5)  # Simulate processing time
+                # Initialize result variables
+                detections = []
+                is_counterfeit = True  # Default to suspicious if anything fails
+                confidence = 0.0
 
-                    # ensure counter exists (works even if not set in __init__)
-                    if not hasattr(self, "simulation_counter"):
-                        self.simulation_counter = 0
+                # Validate input image
+                if image is None:
+                    print("Error: Received None image")
+                    self.result_ready.emit({
+                        "error": "No image received for analysis",
+                        "timestamp": datetime.now().isoformat()
+                    })
+                    continue
 
-                    # Cycle: authentic -> counterfeit -> authentic -> ...
-                    if self.simulation_counter % 2 == 0:
-                        # Authentic case (higher confidence)
-                        confidence = random.uniform(0.88, 0.98)
-                        is_counterfeit = False
-                    else:
-                        # Counterfeit case (lower confidence)
-                        confidence = random.uniform(0.60, 0.75)
-                        is_counterfeit = True
+                if image.isNull():
+                    print("Error: Received null/invalid QImage")
+                    self.result_ready.emit({
+                        "error": "Invalid image for analysis",
+                        "timestamp": datetime.now().isoformat()
+                    })
+                    continue
 
-                    self.simulation_counter += 1
+                print(f"Processing image: {image.width()}x{image.height()} format={image.format()}")
 
-                    # Simulated detections
-                    detections = [{
-                        "box": (50, 50, 270, 190),
-                        "confidence": confidence,
-                        "class": "medicine_package"
-                    }]
+                # Prepare image bytes for upload (JPEG)
+                try:
+                    # Create a copy of the image to ensure we have a clean buffer
+                    image_copy = image.copy()
+                    
+                    # Convert to RGB if needed (Roboflow expects RGB)
+                    if image_copy.format() != QImage.Format.Format_RGB888:
+                        print(f"Converting image from format {image_copy.format()} to RGB888")
+                        image_copy = image_copy.convertToFormat(QImage.Format.Format_RGB888)
+                    
+                    buffer = QByteArray()
+                    buf = QBuffer(buffer)
+                    if not buf.open(QIODevice.OpenModeFlag.WriteOnly):
+                        raise IOError("Failed to open QBuffer for writing")
+                    
+                    # Save as JPEG with 95% quality
+                    if not image_copy.save(buf, 'JPEG', 95):
+                        raise IOError("Failed to save image as JPEG")
+                    
+                    # Get the QByteArray data
+                    img_bytes = bytes(buffer.data())  # Convert QByteArray to bytes directly
+                    if not img_bytes:
+                        raise ValueError("No bytes written to buffer")
+                    
+                    print(f"Successfully prepared image: {len(img_bytes)} bytes")
+                    
+                except Exception as e:
+                    print(f"Failed to prepare image: {str(e)}")
+                    print(f"Image details: size={image.size()}, format={image.format()}, depth={image.depth()}, isNull={image.isNull()}")
+                    self.result_ready.emit({
+                        "error": f"Failed to prepare image: {str(e)}",
+                        "details": f"Image format: {image.format()}, Size: {image.width()}x{image.height()}",
+                        "timestamp": datetime.now().isoformat()
+                    })
+                    continue
+
+                # Get and validate Roboflow credentials
+                roboflow_key = os.environ.get('ROBOFLOW_API_KEY')
+                roboflow_model = os.environ.get('ROBOFLOW_MODEL')
+                roboflow_workspace = os.environ.get('ROBOFLOW_WORKSPACE')
+                roboflow_workflow = os.environ.get('ROBOFLOW_WORKFLOW')
+                
+                print("Roboflow Configuration:")
+                print(f"API Key: {'configured' if roboflow_key else 'missing'}")
+                print(f"Model ID: {roboflow_model or 'missing'}")
+                print(f"Workspace: {roboflow_workspace or 'missing'}")
+                print(f"Workflow: {roboflow_workflow or 'missing'}")
+
+                if not NETWORK_AVAILABLE:
+                    print("Network not available - cannot perform inference")
+                    self.result_ready.emit({
+                        "error": "Network connection required for analysis",
+                        "timestamp": datetime.now().isoformat()
+                    })
+                    continue
+
+                # Determine if we have credentials for either SDK or HTTP path
+                sdk_api_key = os.environ.get('ROBOFLOW_API_KEY') or roboflow_key
+                has_sdk = INFERENCE_SDK_AVAILABLE and sdk_api_key
+                has_http = bool(roboflow_key and roboflow_model)
+
+                if not has_sdk and not has_http:
+                    print("Roboflow credentials not configured (need SDK API key or HTTP API key+model)")
+                    self.result_ready.emit({
+                        "error": "Roboflow credentials not configured",
+                        "timestamp": datetime.now().isoformat()
+                    })
+                    continue
+
+                # Perform Roboflow inference using Inference SDK if available, else fallback to requests
+                try:
+                    # Ensure image bytes look sane
+                    if not img_bytes or len(img_bytes) < 100:
+                        raise ValueError(f"Invalid or too-small image bytes: {len(img_bytes) if img_bytes else 0}")
+
+                    # Try SDK first when available
+                    sdk_used = False
+                    roboflow_workspace = os.environ.get('ROBOFLOW_WORKSPACE') or 'counterfeit-medicine-detector-ujqza'
+                    roboflow_workflow = os.environ.get('ROBOFLOW_WORKFLOW') or 'custom-workflow'
+                    sdk_api_key = os.environ.get('ROBOFLOW_API_KEY') or roboflow_key
+
+                    temp_path = None
+                    try:
+                        if INFERENCE_SDK_AVAILABLE and sdk_api_key:
+                            # Save image to temp file (SDK example uses file path)
+                            temp_path = 'temp_scan.jpg'
+                            with open(temp_path, 'wb') as f:
+                                f.write(img_bytes)
+
+                            client = InferenceHTTPClient(api_url='https://serverless.roboflow.com', api_key=sdk_api_key)
+                            print(f"Running Roboflow workflow {roboflow_workspace}/{roboflow_workflow} via SDK")
+                            result = client.run_workflow(
+                                workspace_name=roboflow_workspace,
+                                workflow_id=roboflow_workflow,
+                                images={"image": temp_path},
+                                use_cache=True
+                            )
+
+                            # SDK result parsing - robust fallback checking
+                            data = result if isinstance(result, dict) else getattr(result, 'to_dict', lambda: result)()
+                            sdk_used = True
+                        else:
+                            raise RuntimeError('Inference SDK not available or API key missing')
+                    finally:
+                        if temp_path and os.path.exists(temp_path):
+                            try:
+                                os.remove(temp_path)
+                            except Exception:
+                                pass
+
+                    # If SDK used, attempt to parse predictions
+                    if sdk_used:
+                        preds = []
+                        if isinstance(data, dict):
+                            preds = data.get('predictions') or data.get('preds') or data.get('outputs') or []
+                        else:
+                            preds = []
+
+                        max_conf = 0.0
+                        for p in preds:
+                            # Attempt to handle different SDK response shapes
+                            x = p.get('x', 0)
+                            y = p.get('y', 0)
+                            w = p.get('width', p.get('w', 0))
+                            h = p.get('height', p.get('h', 0))
+                            conf = p.get('confidence', p.get('score', 0))
+                            cls = p.get('class', p.get('label', 'object'))
+
+                            x1 = x - w / 2
+                            y1 = y - h / 2
+                            x2 = x + w / 2
+                            y2 = y + h / 2
+
+                            detections.append({'box': (x1, y1, x2, y2), 'confidence': conf, 'class': cls})
+                            max_conf = max(max_conf, conf)
+                            if 'counterfeit' in str(cls).lower() or conf < 0.7:
+                                is_counterfeit = True
+                            else:
+                                if max_conf >= 0.7:
+                                    is_counterfeit = False
+
+                        confidence = max_conf if max_conf > 0 else 0.0
+                        # If SDK produced no preds, fall through to HTTP path below
+                        if not preds:
+                            sdk_used = False
+
+                    # Fallback: use HTTP POST to serverless endpoint if SDK not used
+                    if not sdk_used:
+                        url = 'https://serverless.roboflow.com'
+                        params = {'api_key': roboflow_key}
+                        from io import BytesIO
+                        image_file = BytesIO(img_bytes)
+                        files = {'file': ('scan.jpg', image_file, 'image/jpeg')}
+                        print(f"Sending {len(img_bytes)} bytes to Roboflow HTTP API")
+                        resp = requests.post(url, params=params, files=files, timeout=15)
+                        resp.raise_for_status()
+                        data = resp.json()
+                        preds = data.get('predictions', []) or data.get('preds', [])
+                        max_conf = 0.0
+                        for p in preds:
+                            x = p.get('x', 0)
+                            y = p.get('y', 0)
+                            w = p.get('width', p.get('w', 0))
+                            h = p.get('height', p.get('h', 0))
+                            conf = p.get('confidence', p.get('score', 0))
+                            cls = p.get('class', p.get('label', 'object'))
+                            x1 = x - w / 2
+                            y1 = y - h / 2
+                            x2 = x + w / 2
+                            y2 = y + h / 2
+                            detections.append({'box': (x1, y1, x2, y2), 'confidence': conf, 'class': cls})
+                            max_conf = max(max_conf, conf)
+                            if 'counterfeit' in str(cls).lower() or conf < 0.7:
+                                is_counterfeit = True
+                            else:
+                                if max_conf >= 0.7:
+                                    is_counterfeit = False
+                        confidence = max_conf if max_conf > 0 else 0.0
+
+                except Exception as e:
+                    print(f"Roboflow inference failed: {e}")
+                    self.result_ready.emit({"error": f"Analysis failed: {str(e)}", "timestamp": datetime.now().isoformat()})
+                    continue
                 
                 # Create result dictionary
                 result = {
@@ -1008,6 +1338,8 @@ class TouchCalibrationWidget(QWidget):
 
 class MainWindow(QMainWindow):
     """Main application window"""
+    # Signal used to receive manual results from dashboard/wait thread
+    manual_result = pyqtSignal(dict)
     
     def __init__(self):
         super().__init__()
@@ -1016,6 +1348,18 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Medcheck Pi")
         self.setFixedSize(SCREEN_WIDTH, SCREEN_HEIGHT)
         
+        # Import OpenCV for camera enumeration
+        try:
+            import cv2
+            self.cv2 = cv2
+        except ImportError:
+            self.cv2 = None
+            print("Warning: OpenCV not available for camera enumeration")
+        
+        # Camera selection state
+        self.current_camera_index = 0
+        self.available_cameras = []
+        
         # Initialize components
         self.db_manager = DatabaseManager()
         self.network_manager = NetworkManager()
@@ -1023,16 +1367,29 @@ class MainWindow(QMainWindow):
         
         # Initialize threads
         self.camera_thread = CameraThread(self)
-        self.ai_thread = AIDetectionThread(self)
+        # AI inference removed: we will use the external dashboard to provide results
+        self.ai_thread = None
         self.voice_thread = VoiceCommandThread(self)
+        # Event used to cancel a pending manual scan wait
+        self.scan_cancel_event = threading.Event()
+        
+        # Start optional web dashboard server (for remote O/C control)
+        if FLASK_AVAILABLE:
+            try:
+                self.dashboard_server = DashboardServerThread(host='0.0.0.0', port=5000)
+                self.dashboard_server.start()
+                print(f"Dashboard running at http://0.0.0.0:5000/ (click O or C)")
+            except Exception as e:
+                print(f"Failed to start dashboard server: {e}")
         
         # Connect signals
         self.camera_thread.frame_ready.connect(self.update_preview)
-        self.ai_thread.result_ready.connect(self.process_result)
+        # Manual result signal (emitted when dashboard button pressed)
+        self.manual_result.connect(self.process_result)
         self.voice_thread.command_detected.connect(self.handle_voice_command)
         
-        # Start threads
-        self.ai_thread.start()
+    # Start threads
+    # AI thread disabled (no local inference)
         
         # Initialize TTS engine
         if TTS_AVAILABLE:
@@ -1055,9 +1412,70 @@ class MainWindow(QMainWindow):
         # Start camera
         self.camera_thread.start_camera()
         
+        # Find available cameras
+        self.refresh_cameras()
+        
         # Start voice recognition if available
         if SPEECH_RECOGNITION_AVAILABLE:
             self.voice_thread.start()
+    
+    def refresh_cameras(self):
+        """Scan for available camera devices"""
+        self.camera_combo.clear()
+        self.available_cameras = []
+        
+        if not self.cv2:
+            self.camera_combo.addItem("OpenCV not available")
+            return
+            
+        try:
+            # Check each potential camera index
+            for i in range(8):  # Try first 8 indices
+                cap = self.cv2.VideoCapture(i, self.cv2.CAP_DSHOW)
+                if cap.isOpened():
+                    # Get camera name if possible
+                    ret, _ = cap.read()
+                    if ret:
+                        name = f"Camera {i}"
+                        # Try to get actual device name
+                        try:
+                            cap.set(self.cv2.CAP_PROP_SETTINGS, 1)  # May show device name dialog
+                        except:
+                            pass
+                        self.available_cameras.append(i)
+                        self.camera_combo.addItem(name, i)
+                    cap.release()
+            
+            if self.available_cameras:
+                print(f"Found {len(self.available_cameras)} cameras: {self.available_cameras}")
+                # Select external camera if available (index > 0)
+                if len(self.available_cameras) > 1:
+                    self.camera_combo.setCurrentIndex(1)  # Select first external camera
+            else:
+                self.camera_combo.addItem("No cameras found")
+                
+        except Exception as e:
+            print(f"Error scanning cameras: {e}")
+            self.camera_combo.addItem("Error detecting cameras")
+    
+    def switch_camera(self, index):
+        """Switch to selected camera device"""
+        if not self.available_cameras or index < 0 or index >= len(self.available_cameras):
+            return
+            
+        camera_id = self.available_cameras[index]
+        print(f"Switching to camera {camera_id}")
+        
+        # Stop current camera
+        self.camera_thread.stop_camera()
+        self.camera_thread.wait()
+        
+        # Update camera index and restart
+        self.current_camera_index = camera_id
+        self.camera_thread = CameraThread(self)
+        self.camera_thread.frame_ready.connect(self.update_preview)
+        self.camera_thread.camera_index = camera_id
+        self.camera_thread.start_camera()
     
     def setup_ui(self):
         """Set up the user interface"""
@@ -1113,6 +1531,24 @@ class MainWindow(QMainWindow):
         main_screen = QWidget()
         layout = QVBoxLayout(main_screen)
         
+        # Camera selection controls
+        camera_control_layout = QHBoxLayout()
+        
+        self.camera_combo = QComboBox()
+        self.camera_combo.addItem("Detecting cameras...")
+        self.camera_combo.setMinimumWidth(200)
+        self.camera_combo.currentIndexChanged.connect(self.switch_camera)
+        
+        refresh_camera_button = QPushButton("Refresh")
+        refresh_camera_button.clicked.connect(self.refresh_cameras)
+        
+        camera_control_layout.addWidget(QLabel("Camera:"))
+        camera_control_layout.addWidget(self.camera_combo)
+        camera_control_layout.addWidget(refresh_camera_button)
+        camera_control_layout.addStretch()
+        
+        layout.addLayout(camera_control_layout)
+        
         # Header with logo and title
         header_layout = QHBoxLayout()
         
@@ -1148,32 +1584,31 @@ class MainWindow(QMainWindow):
         self.preview_label.setMinimumSize(300, 200)
         self.preview_label.setStyleSheet("border: none;")
         preview_layout.addWidget(self.preview_label)
-        
+
         layout.addWidget(preview_frame)
-        
-        # Scan button
-        self.scan_button, self.scan_animation = StyleHelper.create_neon_button("START SCAN")
+        # Prominent Start Scan button (visible and easy to press)
+        self.scan_button = QPushButton("START SCAN")
+        self.scan_button.setMinimumHeight(56)
         self.scan_button.setFont(QFont("Orbitron", 14, QFont.Weight.Bold))
-        self.scan_button.setMinimumHeight(60)
+        self.scan_button.setStyleSheet("background-color: #00FFFF; color: #000; border-radius: 8px;")
         self.scan_button.clicked.connect(self.start_scan)
         layout.addWidget(self.scan_button)
-        
-        # Bottom toolbar
+
         toolbar_layout = QHBoxLayout()
-        
+
         history_button = QPushButton("History")
         history_button.clicked.connect(lambda: self.stacked_widget.setCurrentIndex(3))
-        
+
         settings_button = QPushButton("Settings")
         settings_button.clicked.connect(lambda: self.stacked_widget.setCurrentIndex(2))
-        
+
         edu_button = QPushButton("Learn")
         edu_button.clicked.connect(lambda: self.stacked_widget.setCurrentIndex(5))
-        
+
         toolbar_layout.addWidget(history_button)
         toolbar_layout.addWidget(settings_button)
         toolbar_layout.addWidget(edu_button)
-        
+
         layout.addLayout(toolbar_layout)
         
         # Network status indicator
@@ -1489,6 +1924,12 @@ class MainWindow(QMainWindow):
     
     def update_preview(self, image):
         """Update camera preview with the latest frame"""
+        # Keep a copy of the latest frame for manual scanning
+        try:
+            self.last_frame = image.copy()
+        except Exception:
+            self.last_frame = image
+
         self.preview_label.setPixmap(QPixmap.fromImage(image).scaled(
             self.preview_label.width(), 
             self.preview_label.height(),
@@ -1502,12 +1943,60 @@ class MainWindow(QMainWindow):
             self.scan_button.setText("CANCEL SCAN")
             self.scan_button.setStyleSheet(f"background-color: {WARNING_RED}; color: white;")
             
-            # Capture current frame and send to AI
-            current_frame = self.preview_label.pixmap().toImage()
-            self.ai_thread.process_image(current_frame)
-            
+            # Capture current frame and wait for external dashboard input
+            try:
+                current_frame = self.last_frame if hasattr(self, 'last_frame') else self.preview_label.pixmap().toImage()
+            except Exception:
+                current_frame = None
+
+            # Clear previous dashboard event and start background waiter
+            dashboard_state['event'].clear()
+            dashboard_state['value'] = None
+            self.scan_cancel_event.clear()
+
+            def waiter():
+                # Wait for dashboard button (timeout after 60s)
+                print("Waiting for dashboard input (O=legit, C=counterfeit)")
+                got = dashboard_state['event'].wait(timeout=60)
+                if self.scan_cancel_event.is_set():
+                    print("Scan cancelled before input")
+                    return
+                if not got:
+                    # Timeout
+                    print("Timeout waiting for dashboard input")
+                    self.manual_result.emit({"error": "Timeout waiting for dashboard input", "timestamp": datetime.now().isoformat()})
+                    return
+
+                val = dashboard_state.get('value')
+                print(f"Dashboard input received: {val}")
+
+                # Map dashboard values to a manual result
+                if val == 'o':
+                    is_counterfeit = False
+                    confidence = 0.95
+                elif val == 'c':
+                    is_counterfeit = True
+                    confidence = 0.95
+                else:
+                    # Unknown input -> mark suspicious
+                    is_counterfeit = True
+                    confidence = 0.5
+
+                result = {
+                    "is_counterfeit": is_counterfeit,
+                    "confidence": confidence,
+                    "detections": [],
+                    "timestamp": datetime.now().isoformat(),
+                    "image": current_frame
+                }
+
+                # Emit result to main thread
+                self.manual_result.emit(result)
+
+            threading.Thread(target=waiter, daemon=True).start()
+
             # Speak action
-            self.speak("Starting scan. Please hold the medicine package steady.")
+            self.speak("Starting scan. Awaiting external dashboard confirmation.")
         else:
             # Cancel scan
             self.scan_button.setText("START SCAN")
@@ -1834,7 +2323,11 @@ class MainWindow(QMainWindow):
         """Handle application close"""
         # Stop threads
         self.camera_thread.stop_camera()
-        self.ai_thread.stop()
+        if self.ai_thread:
+            try:
+                self.ai_thread.stop()
+            except Exception:
+                pass
         if SPEECH_RECOGNITION_AVAILABLE:
             self.voice_thread.stop()
         
